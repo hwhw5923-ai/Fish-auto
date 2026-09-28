@@ -37,10 +37,10 @@ if not TELEGRAM_BOT_TOKEN:
 # ==========================================
 # WATCHDOG GLOBALS
 # ==========================================
-last_tg_ok = time.time()   # Telegram နောက်ဆုံး ပြန်ဖြေတဲ့ အချိန်
-last_ws_ok = time.time()   # Game WS နောက်ဆုံး message ရတဲ့ အချိန်
-TG_TIMEOUT = 120           # 2 မိနစ် TG မဖြေရင် restart
-WS_TIMEOUT = 180           # 3 မိနစ် WS မရရင် (in-game ဆိုရင်) restart
+last_tg_ok = time.time()
+last_ws_ok = time.time()
+TG_TIMEOUT = 120
+WS_TIMEOUT = 180
 
 # ==========================================
 # CONFIG
@@ -130,6 +130,13 @@ class BotInstance:
         self.stats_lock = threading.Lock()
         self.current_target_id = None
 
+        # === AUTO-RESTART TRACKING ===
+        self.login_start_ts = 0.0
+        self.last_coin_change_ts = 0.0
+        self.last_balance_value = 0
+        self.login_timeout = 25
+        self.coin_stale_timeout = 180
+
     def reset_stats(self):
         with self.stats_lock:
             for k in self.stats:
@@ -180,6 +187,9 @@ class BotInstance:
         self.play_handled = False
         self.in_game = False
         self.current_target_id = None
+        self.login_start_ts = 0.0
+        self.last_coin_change_ts = 0.0
+        self.last_balance_value = 0
         with self.fish_lock:
             self.fish_list.clear()
 
@@ -195,6 +205,11 @@ class BotInstance:
             with self.ws_lock:
                 self.ws_conn = conn
             log.info(f"[{self.token[:10]}...] WS Connected")
+
+            self.login_start_ts = time.time()
+            self.last_coin_change_ts = time.time()
+            self.last_balance_value = 0
+
             self.send_ws(
                 {
                     "route": "mytelLogin",
@@ -261,11 +276,18 @@ class BotInstance:
                 if inner.get("playerId") == self.game_creds.get("username"):
                     with self.stats_lock:
                         self.stats["fish_killed"] += 1
-                        self.stats["coins_gained"] += inner.get("cash", 0)
+                        gained = inner.get("cash", 0)
+                        self.stats["coins_gained"] += gained
+                        if gained > 0:
+                            self.last_coin_change_ts = time.time()
             elif route == "OnUpdateCash":
                 if inner.get("playerId") == self.game_creds.get("username"):
+                    new_cash = inner.get("cash", 0)
                     with self.stats_lock:
-                        self.stats["current_balance"] = inner.get("cash", 0)
+                        if new_cash != self.stats["current_balance"]:
+                            self.last_coin_change_ts = time.time()
+                            self.last_balance_value = new_cash
+                        self.stats["current_balance"] = new_cash
 
             if msg_id == 1:
                 if inner.get("ok"):
@@ -275,6 +297,7 @@ class BotInstance:
                     with self.stats_lock:
                         self.stats["start_balance"] = inner.get("cash", 0)
                         self.stats["current_balance"] = inner.get("cash", 0)
+                    self.last_coin_change_ts = time.time()
 
                     if self.owner_id:
                         try:
@@ -308,6 +331,7 @@ class BotInstance:
             elif msg_id == 2:
                 if inner.get("ok"):
                     self.play_handled = True
+                    self.last_coin_change_ts = time.time()
                     self.start_game_actions(ws)
         except Exception as e:
             if not self.is_restarting:
@@ -462,10 +486,15 @@ class BotInstance:
             start_time = time.time()
             while self.is_running and not self.is_restarting:
                 elapsed = time.time() - start_time
+                now = time.time()
+
+                # 1) Cycle duration ကုန်ရင်
                 if elapsed >= self.cycle_duration:
                     log.info(f"[{self.token[:10]}...] Cycle finished")
                     self.log_stats()
                     break
+
+                # 2) Error limit ကျော်ရင်
                 if self.error_count >= self.max_errors:
                     log.info(f"[{self.token[:10]}...] Max errors, restarting")
                     self.log_stats()
@@ -478,6 +507,8 @@ class BotInstance:
                         except Exception:
                             pass
                     break
+
+                # 3) Shoot thread သေရင်
                 if (
                     self.in_game
                     and not self.shoot_alive
@@ -487,6 +518,43 @@ class BotInstance:
                     log.info(f"[{self.token[:10]}...] Shoot died, restarting")
                     self.log_stats()
                     break
+
+                # 4) Login မအောင်ရင် (25s အတွင်း)
+                if not self.login_handled:
+                    if now - self.login_start_ts > self.login_timeout:
+                        log.warning(
+                            f"[{self.token[:10]}...] ❌ Login failed within "
+                            f"{self.login_timeout}s → auto restart"
+                        )
+                        if self.owner_id:
+                            try:
+                                bot.send_message(
+                                    self.owner_id,
+                                    f"⚠️ Login timeout for {self.token[:10]}... → restarting",
+                                )
+                            except Exception:
+                                pass
+                        break
+                else:
+                    # 5) Coin မပြောင်းတာ ကြာရင်
+                    if self.in_game:
+                        stale = now - self.last_coin_change_ts
+                        if stale > self.coin_stale_timeout:
+                            log.warning(
+                                f"[{self.token[:10]}...] ❌ No coin change for "
+                                f"{stale:.0f}s → auto restart"
+                            )
+                            self.log_stats()
+                            if self.owner_id:
+                                try:
+                                    bot.send_message(
+                                        self.owner_id,
+                                        f"⚠️ No coin change for {stale:.0f}s → restarting {self.token[:10]}...",
+                                    )
+                                except Exception:
+                                    pass
+                            break
+
                 time.sleep(1)
 
             log.info(f"[{self.token[:10]}...] Closing connection")
@@ -714,7 +782,6 @@ def status_cmd(message):
 # WATCHDOG + POLLING + SUPERVISOR
 # ==========================================
 def polling_loop():
-    """Telegram ကို long-poll လုပ်ပြီး last_tg_ok ကို update လုပ်တယ်"""
     global last_tg_ok
     offset = None
     try:
@@ -744,7 +811,6 @@ def polling_loop():
 
 
 def watchdog_loop():
-    """TG/WS နှစ်ခုလုံး ဂပ်နေရင် process ကို သတ်ပြီး parent loop က ပြန် run စေတယ်"""
     global last_tg_ok, last_ws_ok
     while True:
         time.sleep(20)
@@ -763,7 +829,6 @@ def watchdog_loop():
 
 
 def main_loop():
-    """Main supervisor — crash ဖြစ်ရင် restart"""
     while True:
         try:
             log.info("🚀 Starting bot supervisor...")
