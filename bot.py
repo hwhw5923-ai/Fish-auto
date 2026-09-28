@@ -4,7 +4,7 @@ import json
 import time
 import threading
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Update as TgUpdate
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import ssl
 import math
 import sys
@@ -728,7 +728,6 @@ def polling_loop():
                 offset=offset,
                 timeout=25,
                 long_polling_timeout=20,
-                allowed_updates=TgUpdate.ALL_TYPES,
             )
             last_tg_ok = time.time()
 
