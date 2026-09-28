@@ -1,0 +1,59 @@
+name: Fish Bot Runner
+
+on:
+  workflow_dispatch:
+  schedule:
+    # ၆ နာရီတစ်ခါ အသစ်ပြန် run (job တစ်ခုက max 6h ဆိုတော့)
+    - cron: '0 */6 * * *'
+
+# တစ်ချိန်တည်း run ၂ ခု မဖြစ်အောင်
+concurrency:
+  group: fishbot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # 5h55m — 6h limit အောက် နည်းနည်းနေပါ
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # bot_config.json ကို run တစ်ခုနဲ့တစ်ခု ဆက်ထားဖို့ cache သုံး
+      - name: Restore bot config
+        uses: actions/cache/restore@v4
+        with:
+          path: bot_config.json
+          key: botcfg-${{ github.run_id }}
+          restore-keys: |
+            botcfg-
+
+      - name: Run bot (auto-restart loop)
+        env:
+          PYTHONUNBUFFERED: "1"
+          # token ကို Secrets ထဲက ယူချင်ရင် bot.py မှာ os.environ နဲ့ ဖတ်ပါ
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          END=$((SECONDS + 19800))   # ~5.5h
+          while [ $SECONDS -lt $END ]; do
+            timeout 1800 python bot.py || true   # 30 min ခြား restart
+            sleep 5
+          done
+
+      - name: Save bot config
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bot_config.json
+          key: botcfg-${{ github.run_id }}
